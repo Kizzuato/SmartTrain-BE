@@ -19,8 +19,6 @@ app.post("/register", async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = await User.create({ username, password: hashedPassword });
-    console.log("JWT_SECRET in login:", process.env.JWT_SECRET);
-    console.log("JWT_SECRET in me:", process.env.JWT_SECRET);
     res.status(201).json({ message: "User registered successfully" });
   } catch (error) {
     res.status(500).json({ message: "Error registering user", error });

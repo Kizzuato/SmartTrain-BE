@@ -1,35 +1,43 @@
-// app.js
 const express = require("express");
-const bodyParser = require("body-parser");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { sequelize, User } = require("./models");
+const cors = require("cors");
+const axios = require("axios");
+const { PassThrough } = require("stream");
 require("dotenv").config();
 
-const app = express();
-app.use(bodyParser.json());
+const authMiddleware = require("./middlewares/authmiddleware");
+const autoResync = require("./middlewares/errmiddleware");
 
-app.get("/", async (req, res) => {
-  res.status(201).json({ message: "Halo dari API smart-train" });
+const app = express();
+const clients = [];
+
+app.use(cors());
+app.use(express.json());
+
+// Routes
+app.get("/", (req, res) => {
+  res.status(201).json({ message: "Halo dari API Smart-Train" });
 });
 
 // Register
-app.post("/register", async (req, res) => {
-  const { username, password } = req.body;
+app.post("/auth/register", async (req, res, next) => {
+  const { email, username, password } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    const user = await User.create({ username, password: hashedPassword });
+    await User.create({ email, username, password: hashedPassword });
     res.status(201).json({ message: "User registered successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Error registering user", error });
+    next(error);
   }
 });
 
 // Login
-app.post("/login", async (req, res) => {
-  const { username, password } = req.body;
+app.post("/auth/login", async (req, res, next) => {
+  const { email, password } = req.body;
   try {
-    const user = await User.findOne({ where: { username } });
+    const user = await User.findOne({ where: { email } });
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ message: "Invalid username or password" });
     }
@@ -38,33 +46,92 @@ app.post("/login", async (req, res) => {
     });
     res.json({ token });
   } catch (error) {
-    res.status(500).json({ message: "Error logging in", error });
+    next(error);
   }
 });
 
 // Me
-app.get('/me', async (req, res) => {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader) {
-    return res.status(401).json({ message: 'No token provided' });
-  }
-
-  const token = authHeader.split(' ')[1]; // ambil setelah "Bearer"
+app.get("/auth/user", authMiddleware, async (req, res, next) => {
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findByPk(decoded.userId);
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
+    const user = await User.findByPk(req.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
     res.json({ user });
   } catch (error) {
-    res.status(500).json({ message: 'Error fetching user', error });
+    next(error);
   }
 });
 
-// Sync database and start server
-sequelize.sync().then(() => {
-  app.listen(5000, () => {
-    console.log("Server is running on port 5000");
+// List Users (hanya yang login bisa akses)
+app.get("/users", authMiddleware, async (req, res, next) => {
+  try {
+    const users = await User.findAll();
+    res.json({ users });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 🚀 Live Streaming Proxy (multi client)
+app.get("/stream", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": cameraContentType, // pakai content-type dari kamera
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Pragma": "no-cache",
   });
+
+  clients.push(res);
+
+  req.on("close", () => {
+    const idx = clients.indexOf(res);
+    if (idx !== -1) clients.splice(idx, 1);
+  });
+});
+
+let cameraContentType = "multipart/x-mixed-replace; boundary=frame"; // default
+let cameraStream;
+
+// Relay 1 koneksi dari kamera
+async function startRelay() {
+  const camUrl = "http://192.168.18.16:4747/video"; // MJPEG stream
+
+  try {
+    const response = await axios.get(camUrl, { responseType: "stream" });
+
+    // simpan Content-Type dari kamera (supaya boundary cocok)
+    if (response.headers["content-type"]) {
+      cameraContentType = response.headers["content-type"];
+    }
+
+    cameraStream = response.data;
+
+    // broadcast chunk ke semua client
+    cameraStream.on("data", (chunk) => {
+      clients.forEach((res) => res.write(chunk));
+    });
+
+    cameraStream.on("end", () => {
+      console.log("Camera stream ended, reconnecting in 3s...");
+      setTimeout(startRelay, 3000);
+    });
+
+    cameraStream.on("error", (err) => {
+      console.error("Camera stream error:", err.message);
+      setTimeout(startRelay, 3000);
+    });
+
+  } catch (err) {
+    console.error("Failed to connect camera:", err.message);
+    setTimeout(startRelay, 3000);
+  }
+}
+
+startRelay();
+
+// Error handler untuk auto-resync
+app.use(autoResync);
+
+// Start server
+sequelize.sync().then(() => {
+  app.listen(5000, () => console.log("Server running on port 5000"));
 });
